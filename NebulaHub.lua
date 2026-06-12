@@ -16,6 +16,8 @@
 	  - Tabs, sections, buttons, toggles, sliders, dropdowns (single + multi),
 	    keybinds, textboxes, labels, paragraphs and a full HSV colour picker
 	  - Notification system with 4 severities and progress timers
+	  - Script Finder tab: searches ScriptBlox + Rscripts for scripts (by keyword
+	    or for the game you are in) and executes them in one tap
 	  - Search bar that filters the controls of the open tab
 	  - Config save / load (uses writefile when ran in an executor)
 	  - FPS / ping watermark
@@ -2403,6 +2405,857 @@ mySection:AddButton({
 		})
 	end,
 })
+
+----------------------------------------------------------------------
+-- SCRIPT FINDER TAB
+-- Searches public script APIs (ScriptBlox + Rscripts) and lets you
+-- execute the results directly from the hub.
+----------------------------------------------------------------------
+local FinderTab = Window:CreateTab("Finder", "⌕")
+
+do
+	local FINDER_ROW = IS_MOBILE and 40 or 36
+
+	--------------------------------------------------------------
+	-- HTTP helpers (work across executors, fall back to HttpGet)
+	--------------------------------------------------------------
+	local function finderHttpGet(url)
+		local requestFn = (typeof(syn) == "table" and syn.request)
+			or (typeof(http) == "table" and http.request)
+			or (typeof(fluxus) == "table" and fluxus.request)
+			or http_request
+			or request
+		if typeof(requestFn) == "function" then
+			local ok, response = pcall(requestFn, { Url = url, Method = "GET" })
+			if ok and typeof(response) == "table" then
+				local body = response.Body or response.body
+				local status = response.StatusCode or response.status_code
+				if typeof(body) == "string" and #body > 0 and (status == nil or status == 200) then
+					return body
+				end
+			end
+		end
+		local ok, body = pcall(function()
+			return game:HttpGet(url)
+		end)
+		if ok and typeof(body) == "string" and #body > 0 then
+			return body
+		end
+		return nil
+	end
+
+	local function finderGetJson(url)
+		local body = finderHttpGet(url)
+		if not body then
+			return nil
+		end
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+		if ok and typeof(data) == "table" then
+			return data
+		end
+		return nil
+	end
+
+	local function urlEncode(text)
+		local encoded = tostring(text):gsub("[^%w%-%.%_%~ ]", function(char)
+			return string.format("%%%02X", string.byte(char))
+		end)
+		encoded = encoded:gsub(" ", "%%20")
+		return encoded
+	end
+
+	--------------------------------------------------------------
+	-- Current game detection
+	--------------------------------------------------------------
+	local cachedGameName
+	local function getGameName()
+		if cachedGameName then
+			return cachedGameName
+		end
+		local ok, info = pcall(function()
+			return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+		end)
+		if ok and typeof(info) == "table" and info.Name then
+			cachedGameName = tostring(info.Name)
+			return cachedGameName
+		end
+		return nil
+	end
+
+	-- Strips emojis / tags like "[UPDATE]" so the name searches better
+	local function cleanGameName(name)
+		local cleaned = name:gsub("%b[]", ""):gsub("%b()", "")
+		cleaned = cleaned:gsub("[^%w%s]", "")
+		cleaned = cleaned:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+		return cleaned
+	end
+
+	--------------------------------------------------------------
+	-- Script sources
+	--------------------------------------------------------------
+	local function searchScriptBlox(query, page)
+		local url = "https://scriptblox.com/api/script/search?q=" .. urlEncode(query)
+			.. "&page=" .. tostring(page) .. "&max=20"
+		local data = finderGetJson(url)
+		local result = data and data.result
+		if not result or typeof(result.scripts) ~= "table" then
+			-- the API returns { message = "..." } when search is down
+			local message = data and typeof(data.message) == "string" and data.message or nil
+			return nil, nil, message
+		end
+		local entries = {}
+		for _, raw in ipairs(result.scripts) do
+			table.insert(entries, {
+				Title = tostring(raw.title or "Untitled"),
+				GameName = (typeof(raw.game) == "table" and tostring(raw.game.name or "")) or "",
+				PlaceId = (typeof(raw.game) == "table" and tonumber(raw.game.gameId)) or nil,
+				Views = tonumber(raw.views) or 0,
+				Verified = raw.verified == true,
+				HasKey = raw.key == true,
+				Patched = raw.isPatched == true,
+				Universal = raw.isUniversal == true,
+				Paid = raw.scriptType == "paid",
+				Source = (typeof(raw.script) == "string" and #raw.script > 0) and raw.script or nil,
+				Slug = (typeof(raw.slug) == "string" and raw.slug) or nil,
+				From = "ScriptBlox",
+			})
+		end
+		return entries, math.max(tonumber(result.totalPages) or 1, 1)
+	end
+
+	local function searchRscripts(query, page)
+		local url = "https://rscripts.net/api/v2/scripts?page=" .. tostring(page)
+			.. "&orderBy=views&sort=desc&q=" .. urlEncode(query)
+		local data = finderGetJson(url)
+		if not data or typeof(data.scripts) ~= "table" then
+			local message = data and typeof(data.error) == "string" and data.error or nil
+			return nil, nil, message
+		end
+		local entries = {}
+		for _, raw in ipairs(data.scripts) do
+			table.insert(entries, {
+				Title = tostring(raw.title or "Untitled"),
+				GameName = (typeof(raw.game) == "table" and tostring(raw.game.title or "")) or "",
+				PlaceId = (typeof(raw.game) == "table" and tonumber(raw.game.placeId)) or nil,
+				Views = tonumber(raw.views) or 0,
+				Verified = typeof(raw.user) == "table" and raw.user.verified == true,
+				HasKey = raw.keySystem == true,
+				Patched = false,
+				Universal = false,
+				Paid = raw.paid == true,
+				RawUrl = (typeof(raw.rawScript) == "string" and #raw.rawScript > 0) and raw.rawScript or nil,
+				From = "Rscripts",
+			})
+		end
+		local totalPages = (typeof(data.info) == "table" and tonumber(data.info.maxPages)) or 1
+		return entries, math.max(totalPages, 1)
+	end
+
+	-- Gets the actual Lua source for a result (some APIs only return links)
+	local function resolveSource(entry)
+		if entry.Source then
+			return entry.Source
+		end
+		if entry.RawUrl then
+			local body = finderHttpGet(entry.RawUrl)
+			if body and #body > 0 then
+				return body
+			end
+		end
+		if entry.Slug then
+			local data = finderGetJson("https://scriptblox.com/api/script/" .. entry.Slug)
+			if data and typeof(data.script) == "table"
+				and typeof(data.script.script) == "string" and #data.script.script > 0 then
+				return data.script.script
+			end
+			local raw = finderHttpGet("https://rawscripts.net/raw/" .. entry.Slug)
+			if raw and #raw > 0 and not raw:find("^%s*<") then
+				return raw
+			end
+		end
+		return nil
+	end
+
+	--------------------------------------------------------------
+	-- Execute / copy actions
+	--------------------------------------------------------------
+	local function executeEntry(entry)
+		Library:Notify({
+			Title = "Fetching script",
+			Content = entry.Title,
+			Type = "info",
+			Duration = 2,
+		})
+		local source = resolveSource(entry)
+		if not source then
+			Library:Notify({
+				Title = "Fetch failed",
+				Content = "Could not download this script's source.",
+				Type = "error",
+				Duration = 5,
+			})
+			return
+		end
+		local compile = loadstring or load
+		if not compile then
+			Library:Notify({
+				Title = "Executor required",
+				Content = "loadstring is not available in this environment.",
+				Type = "error",
+				Duration = 5,
+			})
+			return
+		end
+		local fn, compileError = compile(source)
+		if not fn then
+			Library:Notify({
+				Title = "Syntax error",
+				Content = tostring(compileError),
+				Type = "error",
+				Duration = 6,
+			})
+			return
+		end
+		local ok, runtimeError = pcall(fn)
+		if ok then
+			Library:Notify({
+				Title = "Executed",
+				Content = entry.Title .. (entry.HasKey and " (this script uses a key system)" or ""),
+				Type = "success",
+				Duration = 4,
+			})
+		else
+			Library:Notify({
+				Title = "Runtime error",
+				Content = tostring(runtimeError),
+				Type = "error",
+				Duration = 6,
+			})
+		end
+	end
+
+	local function copyEntry(entry)
+		local clipboard = setclipboard or toclipboard
+		if not clipboard then
+			Library:Notify({
+				Title = "Unavailable",
+				Content = "Your environment has no clipboard function.",
+				Type = "warning",
+			})
+			return
+		end
+		local source = resolveSource(entry)
+		if not source then
+			Library:Notify({
+				Title = "Fetch failed",
+				Content = "Could not download this script's source.",
+				Type = "error",
+			})
+			return
+		end
+		pcall(clipboard, source)
+		Library:Notify({
+			Title = "Copied",
+			Content = "Script source copied to clipboard.",
+			Type = "success",
+		})
+	end
+
+	--------------------------------------------------------------
+	-- UI: section builder matching the library style
+	--------------------------------------------------------------
+	local function finderSection(titleText, order)
+		local sectionFrame = New("Frame", {
+			BackgroundColor3 = Theme.Sidebar,
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = order,
+			Parent = FinderTab.Page,
+		})
+		Round(sectionFrame, 10)
+		Stroke(sectionFrame, Theme.Stroke, 1, 0.5)
+		Pad(sectionFrame, 10, 12, 10, 10)
+		VList(sectionFrame, 6)
+
+		local headerHolder = New("Frame", {
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 18),
+			LayoutOrder = 0,
+			Parent = sectionFrame,
+		})
+		local headerBar = New("Frame", {
+			Position = UDim2.new(0, 0, 0.5, -5),
+			Size = UDim2.new(0, 3, 0, 10),
+			Parent = headerHolder,
+		})
+		Round(headerBar, 99)
+		registerAccent(headerBar, "BackgroundColor3")
+		New("TextLabel", {
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			Text = titleText,
+			TextSize = 13,
+			TextColor3 = Theme.Text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Position = UDim2.new(0, 10, 0, 0),
+			Size = UDim2.new(1, -10, 1, 0),
+			Parent = headerHolder,
+		})
+		return sectionFrame
+	end
+
+	--------------------------------------------------------------
+	-- UI: search section
+	--------------------------------------------------------------
+	local searchSection = finderSection("Script Finder", 1)
+
+	New("TextLabel", {
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = "Search ScriptBlox or Rscripts for free Roblox scripts and run them right here, "
+			.. "or let the hub find scripts made for the game you are playing.",
+		TextSize = 11,
+		TextColor3 = Theme.TextDim,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextWrapped = true,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = 1,
+		Parent = searchSection,
+	})
+
+	-- Search bar row
+	local searchRow = New("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, FINDER_ROW),
+		LayoutOrder = 2,
+		Parent = searchSection,
+	})
+	local searchBoxHolder = New("Frame", {
+		BackgroundColor3 = Theme.Element,
+		Size = UDim2.new(1, -86, 1, 0),
+		Parent = searchRow,
+	})
+	Round(searchBoxHolder, 8)
+	Stroke(searchBoxHolder, Theme.Stroke, 1, 0.4)
+	New("TextLabel", {
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = "⌕",
+		TextSize = 16,
+		TextColor3 = Theme.TextDim,
+		Position = UDim2.new(0, 10, 0, 0),
+		Size = UDim2.new(0, 16, 1, 0),
+		Parent = searchBoxHolder,
+	})
+	local finderSearchBox = New("TextBox", {
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		PlaceholderText = "Search scripts (e.g. blade ball, admin)...",
+		PlaceholderColor3 = Theme.TextDim,
+		Text = "",
+		TextSize = 12,
+		TextColor3 = Theme.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ClearTextOnFocus = false,
+		Position = UDim2.new(0, 32, 0, 0),
+		Size = UDim2.new(1, -40, 1, 0),
+		Parent = searchBoxHolder,
+	})
+	local searchButton = New("TextButton", {
+		Font = Enum.Font.GothamBold,
+		Text = "Search",
+		TextSize = 12,
+		TextColor3 = Color3.fromRGB(255, 255, 255),
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, 0, 0, 0),
+		Size = UDim2.new(0, 80, 1, 0),
+		AutoButtonColor = false,
+		Parent = searchRow,
+	})
+	Round(searchButton, 8)
+	registerAccent(searchButton, "BackgroundColor3")
+	Pressable(searchButton)
+
+	-- "This game" button
+	local gameButton = New("TextButton", {
+		BackgroundColor3 = Theme.Element,
+		Font = Enum.Font.GothamMedium,
+		Text = "🎮  Find scripts for this game",
+		TextSize = 12,
+		TextColor3 = Theme.Text,
+		Size = UDim2.new(1, 0, 0, FINDER_ROW),
+		AutoButtonColor = false,
+		LayoutOrder = 3,
+		Parent = searchSection,
+	})
+	Round(gameButton, 8)
+	Stroke(gameButton, Theme.Stroke, 1, 0.6)
+	Pressable(gameButton, 0.97)
+
+	-- Source picker (segmented buttons)
+	local sourceRow = New("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, FINDER_ROW - 8),
+		LayoutOrder = 4,
+		Parent = searchSection,
+	})
+	New("TextLabel", {
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = "Source",
+		TextSize = 12,
+		TextColor3 = Theme.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Position = UDim2.new(0, 2, 0, 0),
+		Size = UDim2.new(0, 80, 1, 0),
+		Parent = sourceRow,
+	})
+
+	local selectedSource = "ScriptBlox"
+	local sourceButtons = {}
+	local function refreshSourceButtons()
+		for name, button in pairs(sourceButtons) do
+			local active = name == selectedSource
+			button.BackgroundColor3 = active and Theme.Accent or Theme.Element
+			button.TextColor3 = active and Color3.fromRGB(255, 255, 255) or Theme.TextDim
+			button.Font = active and Enum.Font.GothamBold or Enum.Font.Gotham
+		end
+	end
+	for index, name in ipairs({ "ScriptBlox", "Rscripts" }) do
+		local button = New("TextButton", {
+			Text = name,
+			TextSize = 11,
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -(index - 1) * 92 - (index - 1) * 6, 0, 0),
+			Size = UDim2.new(0, 92, 1, 0),
+			AutoButtonColor = false,
+			Parent = sourceRow,
+		})
+		Round(button, 8)
+		Pressable(button)
+		sourceButtons[name] = button
+		track(button.MouseButton1Click:Connect(function()
+			selectedSource = name
+			refreshSourceButtons()
+		end))
+	end
+	refreshSourceButtons()
+
+	--------------------------------------------------------------
+	-- UI: results section
+	--------------------------------------------------------------
+	local resultsSection = finderSection("Results", 2)
+
+	local statusLabel = New("TextLabel", {
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = "Search above, or tap 'Find scripts for this game'.",
+		TextSize = 11,
+		TextColor3 = Theme.TextDim,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		TextWrapped = true,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = 1,
+		Parent = resultsSection,
+	})
+
+	local resultsHolder = New("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = 2,
+		Parent = resultsSection,
+	})
+	VList(resultsHolder, 6)
+
+	-- Pagination row
+	local pageRow = New("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 28),
+		Visible = false,
+		LayoutOrder = 3,
+		Parent = resultsSection,
+	})
+	local function pageButton(text, anchorRight)
+		local button = New("TextButton", {
+			BackgroundColor3 = Theme.Element,
+			Font = Enum.Font.GothamBold,
+			Text = text,
+			TextSize = 12,
+			TextColor3 = Theme.Text,
+			AnchorPoint = anchorRight and Vector2.new(1, 0) or Vector2.new(0, 0),
+			Position = anchorRight and UDim2.new(1, 0, 0, 0) or UDim2.new(0, 0, 0, 0),
+			Size = UDim2.new(0, 76, 1, 0),
+			AutoButtonColor = false,
+			Parent = pageRow,
+		})
+		Round(button, 8)
+		Stroke(button, Theme.Stroke, 1, 0.6)
+		Pressable(button)
+		return button
+	end
+	local prevButton = pageButton("◀ Prev", false)
+	local nextButton = pageButton("Next ▶", true)
+	local pageLabel = New("TextLabel", {
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = "Page 1 / 1",
+		TextSize = 11,
+		TextColor3 = Theme.TextDim,
+		Size = UDim2.new(1, 0, 1, 0),
+		Parent = pageRow,
+	})
+
+	--------------------------------------------------------------
+	-- Result cards
+	--------------------------------------------------------------
+	local BADGE_COLORS = {
+		["THIS GAME"] = Theme.Accent,
+		VERIFIED  = Color3.fromRGB(86, 214, 134),
+		KEY       = Color3.fromRGB(255, 190, 92),
+		PAID      = Color3.fromRGB(255, 150, 70),
+		PATCHED   = Color3.fromRGB(255, 96, 110),
+		UNIVERSAL = Color3.fromRGB(96, 148, 255),
+	}
+
+	local function clearResults()
+		for _, child in ipairs(resultsHolder:GetChildren()) do
+			if not child:IsA("UIListLayout") then
+				child:Destroy()
+			end
+		end
+	end
+
+	local function formatViews(views)
+		if views >= 1e6 then
+			return string.format("%.1fM", views / 1e6)
+		elseif views >= 1e3 then
+			return string.format("%.1fK", views / 1e3)
+		end
+		return tostring(views)
+	end
+
+	local function createResultCard(entry, order, matchesGame)
+		local card = New("Frame", {
+			BackgroundColor3 = Theme.Element,
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = order,
+			Parent = resultsHolder,
+		})
+		Round(card, 8)
+		Stroke(card, matchesGame and Theme.Accent or Theme.Stroke, 1, matchesGame and 0.3 or 0.6)
+		Pad(card, 8, 10, 10, 10)
+		VList(card, 4, Enum.HorizontalAlignment.Left)
+
+		New("TextLabel", {
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			Text = entry.Title,
+			TextSize = 12,
+			TextColor3 = Theme.Text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextWrapped = true,
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = 1,
+			Parent = card,
+		})
+
+		local metaParts = {}
+		if entry.GameName ~= "" then
+			table.insert(metaParts, entry.GameName)
+		end
+		table.insert(metaParts, formatViews(entry.Views) .. " views")
+		table.insert(metaParts, entry.From)
+		New("TextLabel", {
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			Text = table.concat(metaParts, "  •  "),
+			TextSize = 10,
+			TextColor3 = Theme.TextDim,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextWrapped = true,
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = 2,
+			Parent = card,
+		})
+
+		local badges = {}
+		if matchesGame then
+			table.insert(badges, "THIS GAME")
+		end
+		if entry.Verified then
+			table.insert(badges, "VERIFIED")
+		end
+		if entry.HasKey then
+			table.insert(badges, "KEY")
+		end
+		if entry.Paid then
+			table.insert(badges, "PAID")
+		end
+		if entry.Patched then
+			table.insert(badges, "PATCHED")
+		end
+		if entry.Universal then
+			table.insert(badges, "UNIVERSAL")
+		end
+		if #badges > 0 then
+			local badgeRow = New("Frame", {
+				BackgroundTransparency = 1,
+				Size = UDim2.new(1, 0, 0, 16),
+				LayoutOrder = 3,
+				Parent = card,
+			})
+			New("UIListLayout", {
+				FillDirection = Enum.FillDirection.Horizontal,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 4),
+				Parent = badgeRow,
+			})
+			for badgeIndex, badgeText in ipairs(badges) do
+				local badge = New("TextLabel", {
+					BackgroundColor3 = BADGE_COLORS[badgeText] or Theme.PanelSoft,
+					BackgroundTransparency = 0.75,
+					Font = Enum.Font.GothamBold,
+					Text = " " .. badgeText .. " ",
+					TextSize = 9,
+					TextColor3 = BADGE_COLORS[badgeText] or Theme.TextDim,
+					Size = UDim2.new(0, 0, 1, 0),
+					AutomaticSize = Enum.AutomaticSize.X,
+					LayoutOrder = badgeIndex,
+					Parent = badgeRow,
+				})
+				Round(badge, 4)
+			end
+		end
+
+		local buttonRow = New("Frame", {
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, IS_MOBILE and 32 or 28),
+			LayoutOrder = 4,
+			Parent = card,
+		})
+		local executeButton = New("TextButton", {
+			Font = Enum.Font.GothamBold,
+			Text = "▶  Execute",
+			TextSize = 11,
+			TextColor3 = Color3.fromRGB(255, 255, 255),
+			Size = UDim2.new(0.5, -3, 1, 0),
+			AutoButtonColor = false,
+			Parent = buttonRow,
+		})
+		Round(executeButton, 7)
+		registerAccent(executeButton, "BackgroundColor3")
+		Pressable(executeButton)
+		local copyButton = New("TextButton", {
+			BackgroundColor3 = Theme.PanelSoft,
+			Font = Enum.Font.GothamMedium,
+			Text = "Copy script",
+			TextSize = 11,
+			TextColor3 = Theme.Text,
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, 0, 0, 0),
+			Size = UDim2.new(0.5, -3, 1, 0),
+			AutoButtonColor = false,
+			Parent = buttonRow,
+		})
+		Round(copyButton, 7)
+		Stroke(copyButton, Theme.Stroke, 1, 0.5)
+		Pressable(copyButton)
+
+		track(executeButton.MouseButton1Click:Connect(function()
+			task.spawn(executeEntry, entry)
+		end))
+		track(copyButton.MouseButton1Click:Connect(function()
+			task.spawn(copyEntry, entry)
+		end))
+		return card
+	end
+
+	--------------------------------------------------------------
+	-- Search state + runner
+	--------------------------------------------------------------
+	local finderState = {
+		Query = "",
+		Page = 1,
+		TotalPages = 1,
+		GameFilter = nil, -- PlaceId when launched from "this game"
+		Busy = false,
+	}
+
+	local function updatePagination()
+		pageRow.Visible = finderState.TotalPages > 1
+		pageLabel.Text = "Page " .. finderState.Page .. " / " .. finderState.TotalPages
+		prevButton.TextTransparency = finderState.Page <= 1 and 0.6 or 0
+		nextButton.TextTransparency = finderState.Page >= finderState.TotalPages and 0.6 or 0
+	end
+
+	local function runFinderSearch(query, page, gameFilter)
+		if finderState.Busy then
+			return
+		end
+		query = tostring(query or ""):gsub("^%s+", ""):gsub("%s+$", "")
+		if #query == 0 then
+			Library:Notify({
+				Title = "Empty search",
+				Content = "Type something to search for first.",
+				Type = "warning",
+			})
+			return
+		end
+		finderState.Busy = true
+		finderState.Query = query
+		finderState.Page = page
+		finderState.GameFilter = gameFilter
+		clearResults()
+		pageRow.Visible = false
+		statusLabel.Text = "Searching " .. selectedSource .. " for '" .. query .. "'..."
+
+		task.spawn(function()
+			local searchers = {
+				ScriptBlox = searchScriptBlox,
+				Rscripts = searchRscripts,
+			}
+			local usedSource = selectedSource
+			local entries, totalPages, apiMessage = searchers[usedSource](query, page)
+
+			-- If the chosen source is down (and we're on page 1), try the other one
+			if not entries and page == 1 then
+				local fallback = usedSource == "ScriptBlox" and "Rscripts" or "ScriptBlox"
+				local fbEntries, fbTotalPages = searchers[fallback](query, page)
+				if fbEntries then
+					entries, totalPages = fbEntries, fbTotalPages
+					usedSource = fallback
+					Library:Notify({
+						Title = "Switched source",
+						Content = selectedSource .. " is unavailable, showing "
+							.. fallback .. " results instead.",
+						Type = "warning",
+						Duration = 4,
+					})
+					selectedSource = fallback
+					refreshSourceButtons()
+				end
+			end
+			finderState.Busy = false
+
+			if not entries then
+				statusLabel.Text = "Search failed"
+					.. (apiMessage and (": " .. apiMessage) or ". Make sure you are running this in an "
+						.. "executor that allows HTTP requests (game:HttpGet / request).")
+				Library:Notify({
+					Title = "Search failed",
+					Content = apiMessage or ("Could not reach " .. usedSource .. "."),
+					Type = "error",
+					Duration = 5,
+				})
+				return
+			end
+
+			finderState.TotalPages = math.max(tonumber(totalPages) or 1, 1)
+
+			if #entries == 0 then
+				statusLabel.Text = "No scripts found for '" .. query .. "'. Try different keywords "
+					.. "or switch the source."
+				updatePagination()
+				return
+			end
+
+			-- When searching for the current game, float exact matches to the top
+			local ordered = entries
+			local matchCount = 0
+			if gameFilter then
+				local matching, others = {}, {}
+				for _, entry in ipairs(entries) do
+					if entry.PlaceId == gameFilter then
+						table.insert(matching, entry)
+					else
+						table.insert(others, entry)
+					end
+				end
+				matchCount = #matching
+				ordered = {}
+				for _, entry in ipairs(matching) do
+					table.insert(ordered, entry)
+				end
+				for _, entry in ipairs(others) do
+					table.insert(ordered, entry)
+				end
+			end
+
+			for index, entry in ipairs(ordered) do
+				createResultCard(entry, index, gameFilter ~= nil and entry.PlaceId == gameFilter)
+			end
+
+			if gameFilter then
+				statusLabel.Text = "Found " .. #ordered .. " scripts for '" .. query .. "' - "
+					.. matchCount .. " made exactly for this game (highlighted)."
+			else
+				statusLabel.Text = "Found " .. #ordered .. " scripts for '" .. query
+					.. "' (page " .. finderState.Page .. " of " .. finderState.TotalPages .. ")."
+			end
+			updatePagination()
+		end)
+	end
+
+	--------------------------------------------------------------
+	-- Wire everything up
+	--------------------------------------------------------------
+	track(searchButton.MouseButton1Click:Connect(function()
+		runFinderSearch(finderSearchBox.Text, 1, nil)
+	end))
+	track(finderSearchBox.FocusLost:Connect(function(enterPressed)
+		if enterPressed then
+			runFinderSearch(finderSearchBox.Text, 1, nil)
+		end
+	end))
+	track(gameButton.MouseButton1Click:Connect(function()
+		task.spawn(function()
+			local name = getGameName()
+			if not name then
+				Library:Notify({
+					Title = "Unknown game",
+					Content = "Could not look up this game's name.",
+					Type = "error",
+				})
+				return
+			end
+			local cleaned = cleanGameName(name)
+			if #cleaned == 0 then
+				cleaned = name
+			end
+			finderSearchBox.Text = cleaned
+			runFinderSearch(cleaned, 1, game.PlaceId)
+		end)
+	end))
+	track(prevButton.MouseButton1Click:Connect(function()
+		if finderState.Page > 1 then
+			runFinderSearch(finderState.Query, finderState.Page - 1, finderState.GameFilter)
+		end
+	end))
+	track(nextButton.MouseButton1Click:Connect(function()
+		if finderState.Page < finderState.TotalPages then
+			runFinderSearch(finderState.Query, finderState.Page + 1, finderState.GameFilter)
+		end
+	end))
+
+	-- Show the current game's name on the button once it resolves
+	task.spawn(function()
+		local name = getGameName()
+		if name and gameButton.Parent then
+			gameButton.Text = "🎮  Find scripts for: " .. name
+		end
+	end)
+end
 
 ----------------------------------------------------------------------
 -- SETTINGS TAB

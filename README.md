@@ -10,6 +10,10 @@ A fully decked out, **mobile friendly**, **dark themed** Roblox script hub — e
   - Every control (sliders, dropdowns, colour picker, dragging) works with touch.
   - A floating, draggable **N bubble** lets you hide / show the hub on mobile.
   - Bigger touch targets when a touch screen is detected.
+- **Script Finder** — searches script site APIs (ScriptBlox + Rscripts) right from the hub:
+  - **"Find scripts for this game"** detects the game you're in and pulls up scripts made for it (exact matches highlighted on top).
+  - **Search bar** to look up any script by keyword, with pagination and source switching.
+  - Every result has **Execute** and **Copy script** buttons, plus badges for verified / key system / paid / patched / universal.
 - **Full control set** — buttons (with ripple), toggles, sliders, dropdowns (single + multi select), keybinds, textboxes, labels, paragraphs and an HSV colour picker.
 - **Notifications** — 4 severities (info / success / warning / error) with progress timers.
 - **Search bar** — filters the controls of the open tab as you type.
@@ -25,6 +29,7 @@ A fully decked out, **mobile friendly**, **dark themed** Roblox script hub — e
 | Player | Walk speed + jump power sliders, re-apply after respawn, reset character, camera FOV |
 | Visuals | Fullbright, remove fog, time of day, restore lighting, watermark toggle |
 | Scripts | Quick code runner (executor `loadstring`) + empty slots for your own scripts |
+| Finder | Online script finder — search ScriptBlox / Rscripts or auto-find scripts for the current game, then execute or copy them |
 | Settings | Accent colour picker, UI toggle keybind, config save/load, unload hub |
 
 ## How to run
