@@ -2004,6 +2004,27 @@ function Library:CreateWindow(options)
 				return item
 			end
 
+			----------------------------------------------------------
+			-- Container (empty, ordered frame for custom widgets)
+			----------------------------------------------------------
+			function Section:AddContainer(opts)
+				opts = opts or {}
+				elementOrder = elementOrder + 1
+				local frame = New("Frame", {
+					BackgroundTransparency = 1,
+					Size = UDim2.new(1, 0, 0, opts.Height or 0),
+					AutomaticSize = opts.AutoSize == false
+						and Enum.AutomaticSize.None
+						or Enum.AutomaticSize.Y,
+					LayoutOrder = elementOrder,
+					Parent = sectionFrame,
+				})
+				if opts.Search then
+					registerSearchable(frame, opts.Search)
+				end
+				return frame
+			end
+
 			table.insert(Tab.Sections, Section)
 			return Section
 		end
@@ -3255,6 +3276,751 @@ do
 			gameButton.Text = "🎮  Find scripts for: " .. name
 		end
 	end)
+end
+
+----------------------------------------------------------------------
+-- BUILDER TAB
+-- An easy, no-code automation studio: chain together steps (waits,
+-- remote calls, Lua snippets, notifications, key presses) into a macro,
+-- then play / loop it, save it, or export it as a standalone Lua script.
+----------------------------------------------------------------------
+local BuilderTab = Window:CreateTab("Builder", "⚒")
+
+do
+	local ROWH = IS_MOBILE and 58 or 48
+
+	--------------------------------------------------------------
+	-- State
+	--------------------------------------------------------------
+	local steps = {}          -- ordered list of step tables
+	local remotePaths = {}    -- array of GetFullName() strings
+	local remoteMap = {}      -- path -> Instance
+	local pendingType = "Wait"
+	local pendingRemote = nil
+	local running = false
+	local runToken = 0
+	local loopEnabled = false
+	local loopDelay = 0.5
+
+	-- Forward declared UI handles (assigned when the UI is built below)
+	local remoteDD, valueBox, argsBox, statusLabel, countLabel
+	local macrosDD, hintLabel, stepsHolder, emptyLabel
+
+	local TYPE_TO_KIND = {
+		["Wait"] = "wait",
+		["Fire remote"] = "remote",
+		["Run Lua"] = "lua",
+		["Notify"] = "notify",
+		["Press key"] = "key",
+	}
+
+	local TYPE_HINTS = {
+		["Wait"] = "Value = seconds to pause, e.g. 1.5",
+		["Fire remote"] = "Pick a remote below + optional args, then add the step.",
+		["Run Lua"] = "Value = any Luau code to run (needs an executor).",
+		["Notify"] = "Value = the message to pop up while the macro runs.",
+		["Press key"] = "Value = a key name, e.g. E, Space, MouseButton1.",
+	}
+
+	--------------------------------------------------------------
+	-- Small helpers
+	--------------------------------------------------------------
+	local function trim(text)
+		return (tostring(text or ""):gsub("^%s*(.-)%s*$", "%1"))
+	end
+
+	-- Parses a comma list into real Lua values (numbers / booleans / nil /
+	-- quoted or bare strings). Returns a packed table with an `n` count so
+	-- nil values in the middle survive table.unpack.
+	local function parseArgs(text)
+		local packed = { n = 0 }
+		text = trim(text)
+		if text == "" then
+			return packed
+		end
+		local index = 0
+		for token in string.gmatch(text, "([^,]+)") do
+			index = index + 1
+			local t = trim(token)
+			local value
+			if t == "true" then
+				value = true
+			elseif t == "false" then
+				value = false
+			elseif t == "nil" then
+				value = nil
+			elseif tonumber(t) ~= nil then
+				value = tonumber(t)
+			else
+				local quoted = t:match('^"(.*)"$') or t:match("^'(.*)'$")
+				value = quoted ~= nil and quoted or t
+			end
+			packed[index] = value
+			packed.n = index
+		end
+		return packed
+	end
+
+	local function notify(title, content, kind, duration)
+		Library:Notify({
+			Title = title,
+			Content = content,
+			Type = kind or "info",
+			Duration = duration or 4,
+		})
+	end
+
+	--------------------------------------------------------------
+	-- Remote discovery + firing
+	--------------------------------------------------------------
+	local function scanRemotes()
+		remotePaths = {}
+		remoteMap = {}
+		local ok, descendants = pcall(function()
+			return game:GetDescendants()
+		end)
+		if not ok or typeof(descendants) ~= "table" then
+			notify("Scan failed", "Could not read the game tree.", "error")
+			return
+		end
+		local count = 0
+		for _, obj in ipairs(descendants) do
+			local okClass, isRemote = pcall(function()
+				return obj:IsA("RemoteEvent")
+					or obj:IsA("RemoteFunction")
+					or obj:IsA("UnreliableRemoteEvent")
+			end)
+			if okClass and isRemote then
+				local okPath, path = pcall(function()
+					return obj:GetFullName()
+				end)
+				if okPath and typeof(path) == "string" and not remoteMap[path] then
+					remoteMap[path] = obj
+					table.insert(remotePaths, path)
+					count = count + 1
+				end
+			end
+			if count >= 400 then
+				break
+			end
+		end
+		table.sort(remotePaths)
+		if remoteDD then
+			remoteDD.SetValues(remotePaths)
+		end
+		if count == 0 then
+			notify("No remotes found", "This game exposes no reachable remotes.", "warning")
+		else
+			notify("Scan complete", "Found " .. count .. " remote(s).", "success")
+		end
+	end
+
+	local function invokeRemote(path, packed)
+		local remote = remoteMap[path]
+		if not remote or not remote.Parent then
+			return false, "Remote not found - rescan the game."
+		end
+		local className = remote.ClassName
+		return pcall(function()
+			if className == "RemoteFunction" then
+				remote:InvokeServer(table.unpack(packed, 1, packed.n))
+			else
+				remote:FireServer(table.unpack(packed, 1, packed.n))
+			end
+		end)
+	end
+
+	local function pressKey(keyName)
+		local code
+		local ok = pcall(function()
+			code = Enum.KeyCode[keyName]
+		end)
+		if not ok or not code then
+			return false, "Unknown key '" .. tostring(keyName) .. "'."
+		end
+		local vim
+		pcall(function()
+			vim = game:GetService("VirtualInputManager")
+		end)
+		if vim then
+			local fired = pcall(function()
+				vim:SendKeyEvent(true, code, false, game)
+				task.wait(0.04)
+				vim:SendKeyEvent(false, code, false, game)
+			end)
+			if fired then
+				return true
+			end
+		end
+		return false, "VirtualInputManager is unavailable here."
+	end
+
+	--------------------------------------------------------------
+	-- Step execution
+	--------------------------------------------------------------
+	local function runStep(step)
+		if step.kind == "wait" then
+			task.wait(math.max(step.value or 0, 0))
+		elseif step.kind == "remote" then
+			local ok, err = invokeRemote(step.path, parseArgs(step.args))
+			if not ok then
+				notify("Remote step failed", tostring(err), "warning", 3)
+			end
+		elseif step.kind == "lua" then
+			local compile = loadstring or load
+			if compile then
+				local fn = compile(step.code)
+				if fn then
+					pcall(fn)
+				end
+			end
+		elseif step.kind == "notify" then
+			notify("Macro", step.text or "", "info", 3)
+		elseif step.kind == "key" then
+			local ok, err = pressKey(step.key)
+			if not ok then
+				notify("Key step failed", tostring(err), "warning", 3)
+			end
+		end
+	end
+
+	local function setStatus(text)
+		if statusLabel then
+			statusLabel.Set("Status: " .. text)
+		end
+	end
+
+	local function stopMacro()
+		if not running then
+			return
+		end
+		running = false
+		runToken = runToken + 1
+		setStatus("stopped")
+	end
+
+	local function playMacro()
+		if running then
+			notify("Already running", "Stop the macro before starting it again.", "warning")
+			return
+		end
+		if #steps == 0 then
+			notify("Empty macro", "Add at least one step first.", "warning")
+			return
+		end
+		running = true
+		runToken = runToken + 1
+		local myToken = runToken
+		setStatus(loopEnabled and "looping..." or "running...")
+		task.spawn(function()
+			repeat
+				for _, step in ipairs(steps) do
+					if not running or runToken ~= myToken then
+						break
+					end
+					runStep(step)
+				end
+				if loopEnabled and running and runToken == myToken then
+					task.wait(math.max(loopDelay, 0.05))
+				end
+			until not loopEnabled or not running or runToken ~= myToken
+			if runToken == myToken then
+				running = false
+				setStatus("idle")
+			end
+		end)
+	end
+
+	--------------------------------------------------------------
+	-- Step list rendering
+	--------------------------------------------------------------
+	local function describe(step)
+		if step.kind == "wait" then
+			return "Wait " .. tostring(step.value) .. "s"
+		elseif step.kind == "remote" then
+			local short = step.path:match("([^%.]+)$") or step.path
+			local argsText = (step.args ~= nil and step.args ~= "") and ("(" .. step.args .. ")") or "()"
+			return "Fire " .. short .. argsText
+		elseif step.kind == "lua" then
+			local oneLine = step.code:gsub("%s+", " ")
+			if #oneLine > 42 then
+				oneLine = oneLine:sub(1, 42) .. "..."
+			end
+			return "Run Lua: " .. oneLine
+		elseif step.kind == "notify" then
+			return "Notify: " .. tostring(step.text)
+		elseif step.kind == "key" then
+			return "Press " .. tostring(step.key)
+		end
+		return "Unknown step"
+	end
+
+	local function miniButton(parent, text, xOffset, callback)
+		local button = New("TextButton", {
+			BackgroundColor3 = Theme.PanelSoft,
+			Font = Enum.Font.GothamBold,
+			Text = text,
+			TextSize = 13,
+			TextColor3 = Theme.TextDim,
+			AutoButtonColor = false,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, xOffset, 0.5, 0),
+			Size = UDim2.new(0, IS_MOBILE and 30 or 26, 0, IS_MOBILE and 30 or 26),
+			Parent = parent,
+		})
+		Round(button, 6)
+		Stroke(button, Theme.Stroke, 1, 0.4)
+		Pressable(button)
+		track(button.MouseButton1Click:Connect(callback))
+		return button
+	end
+
+	local function renderSteps()
+		for _, child in ipairs(stepsHolder:GetChildren()) do
+			if child:IsA("Frame") then
+				child:Destroy()
+			end
+		end
+		emptyLabel.Visible = #steps == 0
+		for index, step in ipairs(steps) do
+			local row = New("Frame", {
+				BackgroundColor3 = Theme.Element,
+				Size = UDim2.new(1, 0, 0, ROWH),
+				LayoutOrder = index,
+				Parent = stepsHolder,
+			})
+			Round(row, 8)
+			Stroke(row, Theme.Stroke, 1, 0.6)
+			New("TextLabel", {
+				BackgroundTransparency = 1,
+				Font = Enum.Font.GothamBold,
+				Text = tostring(index),
+				TextSize = 12,
+				TextColor3 = Theme.Accent,
+				TextXAlignment = Enum.TextXAlignment.Center,
+				Position = UDim2.new(0, 2, 0, 0),
+				Size = UDim2.new(0, 22, 1, 0),
+				Parent = row,
+			})
+			New("TextLabel", {
+				BackgroundTransparency = 1,
+				Font = Enum.Font.GothamMedium,
+				Text = describe(step),
+				TextSize = 12,
+				TextColor3 = Theme.Text,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Position = UDim2.new(0, 26, 0, 0),
+				Size = UDim2.new(1, -126, 1, 0),
+				Parent = row,
+			})
+			miniButton(row, "✕", -8, function()
+				table.remove(steps, index)
+				renderSteps()
+			end)
+			miniButton(row, "▾", IS_MOBILE and -42 or -38, function()
+				if index < #steps then
+					steps[index], steps[index + 1] = steps[index + 1], steps[index]
+					renderSteps()
+				end
+			end)
+			miniButton(row, "▴", IS_MOBILE and -76 or -68, function()
+				if index > 1 then
+					steps[index], steps[index - 1] = steps[index - 1], steps[index]
+					renderSteps()
+				end
+			end)
+		end
+		if countLabel then
+			countLabel.Set("Steps in macro: " .. #steps)
+		end
+	end
+
+	local function addStep()
+		local kind = TYPE_TO_KIND[pendingType]
+		local step
+		if kind == "wait" then
+			local seconds = tonumber(trim(valueBox.Get()))
+			if not seconds then
+				notify("Need a number", "Enter the wait time (seconds) in Value.", "warning")
+				return
+			end
+			step = { kind = "wait", value = seconds }
+		elseif kind == "remote" then
+			if not pendingRemote or pendingRemote == "" then
+				notify("No remote picked", "Scan the game, then choose a remote.", "warning")
+				return
+			end
+			step = { kind = "remote", path = pendingRemote, args = trim(argsBox.Get()) }
+		elseif kind == "lua" then
+			local code = valueBox.Get()
+			if trim(code) == "" then
+				notify("Empty code", "Type some Lua in the Value box first.", "warning")
+				return
+			end
+			step = { kind = "lua", code = code }
+		elseif kind == "notify" then
+			local text = trim(valueBox.Get())
+			if text == "" then
+				notify("Empty message", "Type the notification text in Value.", "warning")
+				return
+			end
+			step = { kind = "notify", text = text }
+		elseif kind == "key" then
+			local key = trim(valueBox.Get())
+			if key == "" then
+				notify("No key", "Type a key name (E, Space, ...) in Value.", "warning")
+				return
+			end
+			step = { kind = "key", key = key }
+		else
+			return
+		end
+		table.insert(steps, step)
+		renderSteps()
+		notify("Step added", describe(step), "success", 2)
+	end
+
+	--------------------------------------------------------------
+	-- Save / load macros (file API when available, memory otherwise)
+	--------------------------------------------------------------
+	local MACRO_FOLDER = Library.ConfigFolder .. "/macros"
+	local MemoryMacros = {}
+
+	local function macroPath(name)
+		return MACRO_FOLDER .. "/" .. name .. ".json"
+	end
+
+	local function listMacros()
+		local names = {}
+		if CAN_FILE and typeof(listfiles) == "function" then
+			pcall(function()
+				if typeof(isfolder) == "function" and not isfolder(MACRO_FOLDER) then
+					return
+				end
+				for _, path in ipairs(listfiles(MACRO_FOLDER)) do
+					local name = path:match("([^/\\]+)%.json$")
+					if name then
+						table.insert(names, name)
+					end
+				end
+			end)
+		else
+			for name in pairs(MemoryMacros) do
+				table.insert(names, name)
+			end
+		end
+		table.sort(names)
+		return names
+	end
+
+	local function saveMacro(name)
+		name = trim(name)
+		if name == "" then
+			name = "macro"
+		end
+		local payload = {
+			loop = loopEnabled,
+			delay = loopDelay,
+			steps = steps,
+		}
+		local json = HttpService:JSONEncode(payload)
+		if CAN_FILE then
+			pcall(function()
+				if typeof(makefolder) == "function" and typeof(isfolder) == "function" then
+					if not isfolder(Library.ConfigFolder) then
+						makefolder(Library.ConfigFolder)
+					end
+					if not isfolder(MACRO_FOLDER) then
+						makefolder(MACRO_FOLDER)
+					end
+				end
+				writefile(macroPath(name), json)
+			end)
+		else
+			MemoryMacros[name] = json
+		end
+		if macrosDD then
+			macrosDD.SetValues(listMacros())
+		end
+		notify("Macro saved", "Saved '" .. name .. "' with " .. #steps .. " step(s).", "success")
+	end
+
+	local function loadMacro(name)
+		name = trim(name)
+		if name == "" then
+			notify("No name", "Pick a saved macro first.", "warning")
+			return
+		end
+		local json
+		if CAN_FILE then
+			pcall(function()
+				if isfile(macroPath(name)) then
+					json = readfile(macroPath(name))
+				end
+			end)
+		else
+			json = MemoryMacros[name]
+		end
+		if not json then
+			notify("Not found", "No saved macro named '" .. name .. "'.", "warning")
+			return
+		end
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(json)
+		end)
+		if not ok or typeof(data) ~= "table" or typeof(data.steps) ~= "table" then
+			notify("Load failed", "That macro file is corrupted.", "error")
+			return
+		end
+		steps = {}
+		for _, raw in ipairs(data.steps) do
+			if typeof(raw) == "table" and raw.kind then
+				table.insert(steps, raw)
+			end
+		end
+		renderSteps()
+		notify("Macro loaded", "Loaded '" .. name .. "' (" .. #steps .. " steps).", "success")
+	end
+
+	--------------------------------------------------------------
+	-- Export the macro as a standalone Lua script
+	--------------------------------------------------------------
+	local function argsToLuaString(raw)
+		local packed = parseArgs(raw)
+		local parts = {}
+		for i = 1, packed.n do
+			local value = packed[i]
+			if type(value) == "string" then
+				parts[i] = string.format("%q", value)
+			elseif value == nil then
+				parts[i] = "nil"
+			else
+				parts[i] = tostring(value)
+			end
+		end
+		return table.concat(parts, ", ")
+	end
+
+	local function generateLua()
+		local lines = {
+			"-- Macro exported from Nebula Hub",
+			"local VIM = game:GetService(\"VirtualInputManager\")",
+			"local function findRemote(path)",
+			"\tlocal node = game",
+			"\tfor part in string.gmatch(path, \"[^%.]+\") do",
+			"\t\tif not node then return nil end",
+			"\t\tnode = node:FindFirstChild(part)",
+			"\tend",
+			"\treturn node",
+			"end",
+			"",
+			"task.spawn(function()",
+		}
+		local indent = "\t"
+		if loopEnabled then
+			table.insert(lines, "\twhile true do")
+			indent = "\t\t"
+		end
+		for _, step in ipairs(steps) do
+			if step.kind == "wait" then
+				table.insert(lines, indent .. "task.wait(" .. tostring(step.value) .. ")")
+			elseif step.kind == "remote" then
+				table.insert(lines, indent .. "do")
+				table.insert(lines, indent .. "\tlocal r = findRemote(" .. string.format("%q", step.path) .. ")")
+				table.insert(lines, indent .. "\tif r then")
+				local argList = argsToLuaString(step.args)
+				table.insert(lines, indent .. "\t\tif r:IsA(\"RemoteFunction\") then r:InvokeServer(" .. argList .. ") else r:FireServer(" .. argList .. ") end")
+				table.insert(lines, indent .. "\tend")
+				table.insert(lines, indent .. "end")
+			elseif step.kind == "lua" then
+				table.insert(lines, indent .. "do")
+				for codeLine in (step.code .. "\n"):gmatch("(.-)\n") do
+					table.insert(lines, indent .. "\t" .. codeLine)
+				end
+				table.insert(lines, indent .. "end")
+			elseif step.kind == "notify" then
+				table.insert(lines, indent .. "pcall(function()")
+				table.insert(lines, indent .. "\tgame:GetService(\"StarterGui\"):SetCore(\"SendNotification\", { Title = \"Macro\", Text = " .. string.format("%q", step.text or "") .. ", Duration = 3 })")
+				table.insert(lines, indent .. "end)")
+			elseif step.kind == "key" then
+				table.insert(lines, indent .. "pcall(function()")
+				table.insert(lines, indent .. "\tlocal k = Enum.KeyCode[" .. string.format("%q", step.key) .. "]")
+				table.insert(lines, indent .. "\tVIM:SendKeyEvent(true, k, false, game)")
+				table.insert(lines, indent .. "\ttask.wait(0.04)")
+				table.insert(lines, indent .. "\tVIM:SendKeyEvent(false, k, false, game)")
+				table.insert(lines, indent .. "end)")
+			end
+		end
+		if loopEnabled then
+			table.insert(lines, "\t\ttask.wait(" .. tostring(math.max(loopDelay, 0.05)) .. ")")
+			table.insert(lines, "\tend")
+		end
+		table.insert(lines, "end)")
+		return table.concat(lines, "\n")
+	end
+
+	local function copyAsLua()
+		if #steps == 0 then
+			notify("Nothing to export", "Build a macro first.", "warning")
+			return
+		end
+		local clipboard = setclipboard or toclipboard
+		if not clipboard then
+			notify("No clipboard", "Your environment has no clipboard function.", "warning")
+			return
+		end
+		pcall(clipboard, generateLua())
+		notify("Copied", "Standalone Lua script copied to clipboard.", "success")
+	end
+
+	--------------------------------------------------------------
+	-- UI
+	--------------------------------------------------------------
+	local buildSection = BuilderTab:CreateSection("Automation Builder")
+	buildSection:AddParagraph(
+		"Make your own macro",
+		"Chain together steps to automate this game - waits, remote calls, "
+			.. "Lua snippets, on-screen notifications and key presses. "
+			.. "Pick a step type, fill in Value, then press Add step."
+	)
+	buildSection:AddDropdown({
+		Name = "Step type",
+		Values = { "Wait", "Fire remote", "Run Lua", "Notify", "Press key" },
+		Default = "Wait",
+		Callback = function(value)
+			pendingType = value
+			if hintLabel then
+				hintLabel.Set(TYPE_HINTS[value] or "")
+			end
+		end,
+	})
+	hintLabel = buildSection:AddLabel(TYPE_HINTS["Wait"])
+	valueBox = buildSection:AddTextbox({
+		Name = "Value",
+		Placeholder = "seconds e.g. 1.5",
+	})
+	buildSection:AddLabel("For 'Fire remote' steps: scan, pick a remote, then set args below.")
+	buildSection:AddButton({
+		Name = "Scan game for remotes",
+		Callback = scanRemotes,
+	})
+	remoteDD = buildSection:AddDropdown({
+		Name = "Remote",
+		Values = remotePaths,
+		Callback = function(value)
+			pendingRemote = value
+		end,
+	})
+	argsBox = buildSection:AddTextbox({
+		Name = "Remote args",
+		Placeholder = '1, true, "hello"',
+	})
+	buildSection:AddButton({
+		Name = "➕ Add step",
+		Callback = addStep,
+	})
+
+	local macroSection = BuilderTab:CreateSection("Your macro")
+	statusLabel = macroSection:AddLabel("Status: idle")
+	countLabel = macroSection:AddLabel("Steps in macro: 0")
+	stepsHolder = macroSection:AddContainer({ AutoSize = true })
+	VList(stepsHolder, 6, Enum.HorizontalAlignment.Center)
+	emptyLabel = New("TextLabel", {
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = "No steps yet - add some above.",
+		TextSize = 12,
+		TextColor3 = Theme.TextDim,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Size = UDim2.new(1, 0, 0, 24),
+		LayoutOrder = 0,
+		Parent = stepsHolder,
+	})
+	macroSection:AddButton({
+		Name = "Remove last step",
+		Callback = function()
+			if #steps == 0 then
+				notify("Nothing to remove", "The macro is already empty.", "warning")
+				return
+			end
+			table.remove(steps)
+			renderSteps()
+		end,
+	})
+	macroSection:AddButton({
+		Name = "Clear all steps",
+		Callback = function()
+			steps = {}
+			renderSteps()
+			notify("Cleared", "All steps removed.", "info", 2)
+		end,
+	})
+
+	local playSection = BuilderTab:CreateSection("Playback")
+	playSection:AddToggle({
+		Name = "Loop macro",
+		Default = false,
+		Callback = function(value)
+			loopEnabled = value
+		end,
+	})
+	playSection:AddSlider({
+		Name = "Loop delay",
+		Min = 0,
+		Max = 10,
+		Default = 0.5,
+		Decimals = 1,
+		Suffix = "s",
+		Callback = function(value)
+			loopDelay = value
+		end,
+	})
+	playSection:AddButton({
+		Name = "▶ Play macro",
+		Callback = playMacro,
+	})
+	playSection:AddButton({
+		Name = "■ Stop macro",
+		Callback = stopMacro,
+	})
+
+	local saveSection = BuilderTab:CreateSection("Save & export")
+	if not CAN_FILE then
+		saveSection:AddLabel("No file API found - saved macros only last this session.")
+	end
+	local macroName = saveSection:AddTextbox({
+		Name = "Macro name",
+		Placeholder = "my macro",
+		Default = "macro",
+	})
+	saveSection:AddButton({
+		Name = "Save macro",
+		Callback = function()
+			saveMacro(macroName.Get())
+		end,
+	})
+	macrosDD = saveSection:AddDropdown({
+		Name = "Saved macros",
+		Values = listMacros(),
+		Callback = function(picked)
+			if picked then
+				macroName.Set(picked)
+			end
+		end,
+	})
+	saveSection:AddButton({
+		Name = "Load selected macro",
+		Callback = function()
+			loadMacro(macroName.Get())
+		end,
+	})
+	saveSection:AddButton({
+		Name = "Copy as Lua script",
+		Callback = copyAsLua,
+	})
+
+	renderSteps()
 end
 
 ----------------------------------------------------------------------

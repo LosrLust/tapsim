@@ -14,6 +14,12 @@ A fully decked out, **mobile friendly**, **dark themed** Roblox script hub — e
   - **"Find scripts for this game"** detects the game you're in and pulls up scripts made for it (exact matches highlighted on top).
   - **Search bar** to look up any script by keyword, with pagination and source switching.
   - Every result has **Execute** and **Copy script** buttons, plus badges for verified / key system / paid / patched / universal.
+- **Automation Builder** — a no-code macro studio for making your own scripts for the game you're in:
+  - Chain together **steps**: `Wait`, `Fire remote`, `Run Lua`, `Notify` and `Press key`.
+  - **Scan game for remotes** finds every `RemoteEvent` / `RemoteFunction` and lets you fire them with typed arguments (numbers, booleans, strings, `nil`).
+  - Reorder (▴ ▾) or delete (✕) any step, then **Play once** or **Loop** with an adjustable delay.
+  - **Save / load** macros (uses `writefile` when available, session memory otherwise).
+  - **Copy as Lua script** exports your macro as a clean standalone Lua file you can run anywhere.
 - **Full control set** — buttons (with ripple), toggles, sliders, dropdowns (single + multi select), keybinds, textboxes, labels, paragraphs and an HSV colour picker.
 - **Notifications** — 4 severities (info / success / warning / error) with progress timers.
 - **Search bar** — filters the controls of the open tab as you type.
@@ -30,6 +36,7 @@ A fully decked out, **mobile friendly**, **dark themed** Roblox script hub — e
 | Visuals | Fullbright, remove fog, time of day, restore lighting, watermark toggle |
 | Scripts | Quick code runner (executor `loadstring`) + empty slots for your own scripts |
 | Finder | Online script finder — search ScriptBlox / Rscripts or auto-find scripts for the current game, then execute or copy them |
+| Builder | No-code automation builder — chain steps (waits, remote calls, Lua, notifications, key presses) into a macro, play/loop it, save it, or export it as a standalone Lua script |
 | Settings | Accent colour picker, UI toggle keybind, config save/load, unload hub |
 
 ## How to run
@@ -54,6 +61,22 @@ mySection:AddButton({
 	end,
 })
 ```
+
+## Building a macro (no code needed)
+
+Open the **Builder** tab and assemble a macro step by step:
+
+1. Choose a **Step type** and fill in the **Value** box (the hint under the dropdown tells you what to type).
+   - `Wait` → seconds to pause (e.g. `1.5`)
+   - `Run Lua` → any Luau code (needs an executor)
+   - `Notify` → an on-screen message
+   - `Press key` → a key name (`E`, `Space`, `MouseButton1`, ...)
+2. For a `Fire remote` step, press **Scan game for remotes**, pick one from the **Remote** dropdown, and (optionally) type comma-separated **args** like `1, true, "hello"`.
+3. Press **➕ Add step**. Steps appear in *Your macro*, where you can reorder (▴ ▾) or remove (✕) them.
+4. In **Playback**, hit **▶ Play macro** to run it once, or turn on **Loop macro** (with a delay) to repeat it.
+5. In **Save & export**, save the macro for later, or press **Copy as Lua script** to get a clean standalone Lua file you can run anywhere.
+
+Macros are stored as JSON under `NebulaHub/macros/` when your executor exposes a file API.
 
 ## Using the library for your own hub
 
