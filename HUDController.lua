@@ -4,17 +4,23 @@
 	Location: StarterPlayerScripts
 
 	@description  Tap, BuyRune, fruit teleport-collect, ore auto-mine with MineRange detection.
-	@version      4.4.0
+	@version      4.5.0
 
-	v4.4.0  Auto-mine no longer hangs on a depleted ore until it regenerates.
-	        The inner loop now rotates to the next ore the moment the current
-	        one is mined out, using layered depletion signals:
-	          1. known depletion / "can-mine" / health attributes
-	          2. a generic "stall" detector (no observable change for N hits)
-	          3. a per-ore time budget + small hit cap as hard upper bounds
-	        Ores are also visited nearest-first each pass for tighter routing,
-	        and RUN DUMP now prints every ore attribute / child so the exact
-	        depletion signal for a given game can be pinned down.
+	v4.5.0  Auto-mine is now progress-driven and skips ores it can't mine.
+	          • Each hit reads the MineOre server reply; a productive hit (or any
+	            observable change on the ore) keeps the ore "alive" so big ores
+	            are mined to completion instead of being abandoned early.
+	          • Rotation happens after a short no-progress window (MINE_NOPROGRESS)
+	            rather than a fixed time budget, so it leaves spent/locked ores
+	            fast but never bails on one that's still yielding.
+	          • Per-ore exponential backoff: ores that yield nothing (pickaxe too
+	            weak, or mid-regen) are parked on a growing cooldown so they're
+	            skipped ASAP, while productive ores reset to a short regen cooldown.
+	          • RUN DUMP reports productive/blocked counts for tuning.
+
+	v4.4.0  Rotate to the next ore the moment the current one is mined out
+	        (ores regenerate in place and are never removed from the folder),
+	        using layered depletion signals and nearest-first routing.
 ]]
 
 -- ── Services ──────────────────────────────────────────────────────────────────
@@ -64,6 +70,8 @@ local fruitAttempts = 0
 local fruitFails    = 0
 local mineTotal     = 0
 local mineOreCount  = 0   -- ores rotated through (for debug)
+local mineSuccess   = 0   -- hits the server reported as productive
+local mineBlocked   = 0   -- ores skipped this session as un-mineable
 local counterReset  = tick()
 local hudVisible    = true
 local debugVisible  = false
@@ -72,15 +80,26 @@ local fruitCooldown  = {}
 local fruitCollected = {}
 local _oresCache: Instance? = nil
 
+-- Per-ore mining state, keyed by the ore Model instance (models persist across
+-- regen). Tracks an exponential backoff cooldown so we stop wasting time on
+-- ores that yield nothing (pickaxe too weak) while still revisiting ones that
+-- are merely regenerating.
+local mineState = {}  -- [Model] = { until_: number, fails: number, reason: string }
+
 -- ── Timing ────────────────────────────────────────────────────────────────────
 local TELEPORT_WAIT  = 0.25
 local FRUIT_SCAN     = 0.15
 local FRUIT_RETRY    = 0.5
-local MINE_INTERVAL  = 0.15   -- seconds between mine hits
-local MINE_MAX_HITS  = 40     -- hard safety cap per ore per pass
-local MINE_STALL_HITS = 4     -- consecutive no-change hits => treat as depleted, rotate
-local MINE_ORE_BUDGET = 4.0   -- max seconds to spend on one ore before rotating
-local MINE_EMPTY_WAIT = 0.4   -- pause when no ores are available before rescanning
+local MINE_INTERVAL    = 0.15   -- seconds between mine hits
+local MINE_MAX_HITS    = 600    -- runaway guard only; big ores are allowed to finish
+local MINE_NOPROGRESS  = 0.6    -- seconds with no progress => rotate to next ore
+local MINE_HARD_TIMEOUT = 30.0  -- absolute per-ore safety cap (seconds)
+local MINE_EMPTY_WAIT  = 0.4    -- pause when no ores are available before rescanning
+-- Per-ore cooldown after a visit. Productive ores get the short regen cooldown;
+-- unproductive ores back off exponentially (base, base*2, base*4, ... capped).
+local MINE_REGEN_COOLDOWN = 2.0
+local MINE_BACKOFF_BASE   = 2.0
+local MINE_BACKOFF_MAX    = 45.0
 
 -- Attributes that, when set, indicate an ore is currently depleted / regenerating.
 local MINE_DEPLETED_BOOL = {
@@ -173,6 +192,15 @@ local function oreFingerprint(ore: Model): string
 		parts[#parts+1] = "T=" .. string.format("%.2f", mp.Transparency)
 		parts[#parts+1] = "Col=" .. tostring(mp.CanCollide)
 		parts[#parts+1] = "Sz=" .. string.format("%.1f", mp.Size.Magnitude)
+	end
+	-- model bounding box (big ores often visibly shrink as they're mined)
+	local okbb, _, bsz = pcall(function() return ore:GetBoundingBox() end)
+	if okbb and bsz then parts[#parts+1] = "BB=" .. string.format("%.1f", bsz.Magnitude) end
+	-- value objects parented directly under the ore (health/progress bars, timers)
+	for _, c in ipairs(ore:GetChildren()) do
+		if c:IsA("NumberValue") or c:IsA("IntValue") or c:IsA("BoolValue") then
+			parts[#parts+1] = c.Name .. "#" .. tostring(c.Value)
+		end
 	end
 	return table.concat(parts, "|")
 end
@@ -356,7 +384,7 @@ end
 
 local DebugHeaderText = Instance.new("TextLabel", DebugHeader)
 DebugHeaderText.Size=UDim2.new(1,-100,1,0); DebugHeaderText.Position=UDim2.new(0,14,0,0)
-DebugHeaderText.BackgroundTransparency=1; DebugHeaderText.Text="🔍 Debug  ·  v4.4"
+DebugHeaderText.BackgroundTransparency=1; DebugHeaderText.Text="🔍 Debug  ·  v4.5"
 DebugHeaderText.TextColor3=Color3.fromRGB(185,185,215); DebugHeaderText.TextSize=11
 DebugHeaderText.Font=Enum.Font.GothamBold; DebugHeaderText.TextXAlignment=Enum.TextXAlignment.Left; DebugHeaderText.ZIndex=7
 
@@ -424,7 +452,7 @@ makeDraggable(DebugHeader, DebugPanel)
 -- ── Behavior (all UI locals now in scope) ─────────────────────────────────────
 
 local function dumpToString(): string
-	local L={"==== HUD DEBUG v4.4 ===="}
+	local L={"==== HUD DEBUG v4.5 ===="}
 	local cf=getClientFruits(); local of=getOresFolder(); local root=getRoot()
 	table.insert(L,"HRP: "..(root and tostring(root.Position) or "NONE"))
 	table.insert(L,"CLIENTFRUITS: "..(cf and cf:GetFullName() or "NONE"))
@@ -473,7 +501,8 @@ local function dumpToString(): string
 	end
 	table.insert(L,"")
 	table.insert(L,string.format("Fruit: %d collected / %d attempts / %d fails",fruitTotal,fruitAttempts,fruitFails))
-	table.insert(L,string.format("Mine: %d hits / %d ores rotated",mineTotal,mineOreCount))
+	table.insert(L,string.format("Mine: %d hits / %d productive / %d ores rotated / %d blocked",
+		mineTotal,mineSuccess,mineOreCount,mineBlocked))
 	table.insert(L,"==== END ====")
 	return table.concat(L,"\n")
 end
@@ -524,9 +553,43 @@ local function scanFruits(): number
 	return count
 end
 
--- Mine loop: teleport into each ore's MineRange, swing until it's depleted,
--- then immediately rotate to the next ore (nearest-first) instead of waiting
--- for the spent ore to regenerate in place.
+-- True if the server's reply to a mine hit looks like a successful/productive
+-- hit (a yield number, a table, true, ...). nil / false reads as "rejected"
+-- which is what we get when the ore is depleted or the pickaxe is too weak.
+local function isMineHitSuccess(ok: boolean, res: any): boolean
+	if not ok then return false end
+	if res == nil or res == false then return false end
+	return true
+end
+
+-- Park an ore on cooldown. `productive` ores (we actually mined them) use the
+-- short regen cooldown; unproductive ones back off exponentially so we stop
+-- wasting time on nodes we can't mine yet (e.g. pickaxe too weak).
+local function setOreCooldown(ore: Model, productive: boolean)
+	local st = mineState[ore]
+	if not st then st = { fails = 0 }; mineState[ore] = st end
+	if productive then
+		st.fails = 0
+		st.until_ = os.clock() + MINE_REGEN_COOLDOWN
+		st.reason = "regen"
+	else
+		st.fails += 1
+		local wait = math.min(MINE_BACKOFF_BASE * (2 ^ (st.fails - 1)), MINE_BACKOFF_MAX)
+		st.until_ = os.clock() + wait
+		st.reason = "blocked x" .. st.fails
+		if st.fails == 1 then mineBlocked += 1 end
+	end
+end
+
+local function oreOnCooldown(ore: Model): boolean
+	local st = mineState[ore]
+	return st ~= nil and st.until_ ~= nil and os.clock() < st.until_
+end
+
+-- Mine a single ore: teleport into its MineRange and swing while it keeps
+-- making progress. Rotates the moment progress stalls (depleted / un-mineable)
+-- instead of camping the node or abandoning a big ore that's still yielding.
+-- Returns true if at least one productive hit landed.
 local function mineOne(entry, root: BasePart): boolean
 	local ore=entry.model; local oreId=entry.id
 	if not ore.Parent then return false end
@@ -534,8 +597,8 @@ local function mineOne(entry, root: BasePart): boolean
 	local mrPos,mrRadius=getMineRange(ore)
 	if not mrPos or not mrRadius then return false end
 
-	-- already regenerating? skip without wasting hits
-	if isOreDepleted(ore) then return false end
+	-- already regenerating per a known attribute? skip without wasting hits
+	if isOreDepleted(ore) then setOreCooldown(ore,false); return false end
 
 	-- teleport into the circle if needed
 	if not inRange(root.Position,mrPos,mrRadius) then
@@ -544,13 +607,14 @@ local function mineOne(entry, root: BasePart): boolean
 	end
 
 	local hits=0
-	local stall=0
+	local madeProgress=false
 	local lastFp=oreFingerprint(ore)
 	local startedAt=os.clock()
+	local lastProgress=startedAt
 	mineOreCount+=1
 
 	while mineActive and ore.Parent and hits<MINE_MAX_HITS do
-		root=getRoot(); if not root then return true end
+		root=getRoot(); if not root then return madeProgress end
 
 		-- re-center if we drifted out of range
 		if not inRange(root.Position,mrPos,mrRadius) then
@@ -558,27 +622,30 @@ local function mineOne(entry, root: BasePart): boolean
 			task.wait(TELEPORT_WAIT)
 		end
 
-		pcall(function() MineDispatch:InvokeServer(oreId) end)
+		local ok,res=pcall(function() return MineDispatch:InvokeServer(oreId) end)
 		mineTotal+=1; hits+=1
+
+		-- progress = a successful server hit OR an observable change on the ore
+		local serverOk=isMineHitSuccess(ok,res)
+		local fp=oreFingerprint(ore)
+		if serverOk or fp~=lastFp then
+			madeProgress=true; lastProgress=os.clock(); lastFp=fp
+			if serverOk then mineSuccess+=1 end
+		end
+
 		MineRateLabel.Text=string.format("MINE  ·  %d hits  ·  %s",mineTotal,oreId)
 		task.wait(MINE_INTERVAL)
 
-		-- (1) explicit depletion signal → rotate now
+		-- known depletion signal → done with this ore
 		if isOreDepleted(ore) then break end
-
-		-- (2) generic stall: nothing observable changed for N hits → depleted/regening
-		local fp=oreFingerprint(ore)
-		if fp==lastFp then
-			stall+=1
-			if stall>=MINE_STALL_HITS then break end
-		else
-			stall=0; lastFp=fp
-		end
-
-		-- (3) hard per-ore time budget → never camp a single ore
-		if os.clock()-startedAt>=MINE_ORE_BUDGET then break end
+		-- no progress for a short window → depleted or can't mine → rotate now
+		if os.clock()-lastProgress>=MINE_NOPROGRESS then break end
+		-- absolute runaway guard
+		if os.clock()-startedAt>=MINE_HARD_TIMEOUT then break end
 	end
-	return true
+
+	setOreCooldown(ore,madeProgress)
+	return madeProgress
 end
 
 local function autoMineLoop()
@@ -592,42 +659,36 @@ local function autoMineLoop()
 		local root=getRoot()
 		if not root then task.wait(0.25); continue end
 
-		-- snapshot current, mineable ores
+		-- snapshot ores that are eligible right now (skip cooldown'd + depleted)
 		local ores={}
+		local skipped=0
 		for _,child in ipairs(of:GetChildren()) do
 			if child:IsA("Model") then
 				local id=child:GetAttribute("OreId")
 				if type(id)=="string" and id~="" then
-					local mrPos=select(1,getMineRange(child))
-					local dist=mrPos and (root.Position-mrPos).Magnitude or math.huge
-					table.insert(ores,{model=child,id=id,pos=mrPos,dist=dist})
+					if oreOnCooldown(child) or isOreDepleted(child) then
+						skipped+=1
+					else
+						local mrPos=select(1,getMineRange(child))
+						local dist=mrPos and (root.Position-mrPos).Magnitude or math.huge
+						table.insert(ores,{model=child,id=id,pos=mrPos,dist=dist})
+					end
 				end
 			end
 		end
 
 		if #ores==0 then
-			MineRateLabel.Text="MINE  ·  0 ores found"
+			MineRateLabel.Text=string.format("MINE  ·  %d hits  ·  waiting (%d on cd)",mineTotal,skipped)
 			task.wait(MINE_EMPTY_WAIT); continue
 		end
 
 		-- nearest-first so we route tightly between ores
 		table.sort(ores,function(a,b) return a.dist<b.dist end)
 
-		local minedAny=false
 		for _,entry in ipairs(ores) do
 			if not mineActive then break end
 			root=getRoot(); if not root then break end
-			-- skip ores already regenerating up front
-			if entry.model.Parent and not isOreDepleted(entry.model) then
-				if mineOne(entry,root) then minedAny=true end
-			end
-		end
-
-		-- everything in this pass was depleted; wait briefly for a regen instead
-		-- of hammering the same spent nodes in a tight loop
-		if not minedAny and mineActive then
-			MineRateLabel.Text=string.format("MINE  ·  %d hits  ·  all regening",mineTotal)
-			task.wait(MINE_EMPTY_WAIT)
+			if entry.model.Parent then mineOne(entry,root) end
 		end
 	end
 end
@@ -715,8 +776,9 @@ local function setMineActive(state: boolean)
 	mineActive=state
 	if mineActive then
 		MineToggle.Text="■  STOP MINE"; MineToggle.BackgroundColor3=Color3.fromRGB(25,100,145)
-		mineTotal=0; mineOreCount=0
-		print("[Mine] Started — workspace.Ores  interval="..tostring(MINE_INTERVAL).."s  budget="..tostring(MINE_ORE_BUDGET).."s")
+		mineTotal=0; mineOreCount=0; mineSuccess=0; mineBlocked=0
+		table.clear(mineState)
+		print("[Mine] Started — workspace.Ores  interval="..tostring(MINE_INTERVAL).."s  noprogress="..tostring(MINE_NOPROGRESS).."s")
 		mineThread=task.spawn(autoMineLoop)
 	else
 		MineToggle.Text="▶  START MINE"; MineToggle.BackgroundColor3=Color3.fromRGB(55,155,195)
